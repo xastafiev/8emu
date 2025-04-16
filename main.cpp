@@ -34,14 +34,15 @@ typedef struct
 
 typedef struct
 {
-  u8*  memory;
-  u16  program_counter;
-  u16  idx_reg;
-  u16* registers;
+  u8*      memory;
+  u16      program_counter;
+  u16      idx_reg;
+  u16*     registers;
+  Program* current_program;
 } Emu;
 
 internal void load_program(Program *program, u8* memory);
-internal inline void NextInstruction(Emu* emu, Program* program, Instruction* inst);
+internal inline void NextInstruction(Emu* emu, Instruction* inst);
 
 // instructions looks like (A - just any char)
 // ANNN
@@ -66,8 +67,8 @@ global_variable BITMAPINFO bitmap_info;
 global_variable void*      bitmap_buffer;
 global_variable HBITMAP    bitmap_handle;
 global_variable HDC        device_context;
-global_variable i32        BitmapWidth;
-global_variable i32        BitmapHeight;
+global_variable i32        BitmapWidth = 64;
+global_variable i32        BitmapHeight = 32;
 global_variable i32        WindowWidth;
 global_variable i32        WindowHeight;
 
@@ -79,25 +80,21 @@ i32 main()
     .buffer_size = 512
   };
 
-  u8 registers[16] = {0};
-
   Emu emu = {
     .memory = (u8*)VirtualAlloc(NULL, 4096, MEM_COMMIT, PAGE_READWRITE),
     .program_counter = 0,
     .idx_reg = 0,
-    .registers = (u16*)VirtualAlloc(NULL, sizeof(u16) * 0xF, MEM_COMMIT, PAGE_READWRITE)
+    .registers = (u16*)VirtualAlloc(NULL, sizeof(u16) * 0xF, MEM_COMMIT, PAGE_READWRITE),
+    .current_program = &ibm_logo
   };
 
   load_program(&ibm_logo, emu.memory);
 
   Instruction curr_inst = {0};
 
-  const i32 SPEC_WIDTH  = 64;
-  const i32 SPEC_HEIGHT = 32;
-
   const i32 WH_FACTOR = 10;
-  const i32 WIDTH     = SPEC_WIDTH * WH_FACTOR;
-  const i32 HEIGHT    = SPEC_HEIGHT * WH_FACTOR;
+  const i32 WIDTH     = BitmapWidth * WH_FACTOR;
+  const i32 HEIGHT    = BitmapHeight * WH_FACTOR;
 
   HWND window = open_window((str)L"8emu", WIDTH, HEIGHT);
   MSG msg;
@@ -105,7 +102,7 @@ i32 main()
   ULONGLONG program_start = GetTickCount64();
   ULONGLONG current_frame_timestamp;
 
-  timeBeginPeriod(1); // more accurate timer resoliton maybe, 1 is not good for some reasons i do not know :))
+  timeBeginPeriod(1);
   double MS_PER_FRAME = 1000.0/60.0;
   while(Running)
   {
@@ -117,41 +114,67 @@ i32 main()
       DispatchMessage(&msg);
     }
 
-    NextInstruction(&emu, &ibm_logo, &curr_inst);
+    NextInstruction(&emu, &curr_inst);
+
+    u8 high_nibble = curr_inst.b0 >> 4;
 
     // 00E0
     if(curr_inst.b0 == 0x00 && curr_inst.b1 == 0xE0)
     {
       Win32FillBuffer(OFF_PIXEL);
     }
-
-    u8 high_nibble = curr_inst.b0 >> 4;
-
     // ANNN
-    if(high_nibble == 0xA)
+    else if(high_nibble == 0xA)
     {
       emu.idx_reg = ExtractNNN(&curr_inst);
     }
-
     // 6XNN
-    if(high_nibble == 0x6)
+    else if(high_nibble == 0x6)
     {
       *(emu.registers + ExtractX(&curr_inst)) = ExtractNN(&curr_inst);
     }
-
     // DXYN
-    if(high_nibble == 0xD)
+    else if (high_nibble == 0xD)
     {
-      u16 x = *(emu.registers + ExtractX(&curr_inst));
-      x = x & (SPEC_WIDTH - 1);
-      u16 y = *(emu.registers + ExtractY(&curr_inst));
-      y = y & (SPEC_HEIGHT - 1);
-      u8  n = ExtractN(&curr_inst);
-    }
+      u8  VX = ExtractX(&curr_inst);
+      u8  VY = ExtractY(&curr_inst);
+      u16 x  = emu.registers[VX] & (BitmapWidth - 1);
+      u16 y  = emu.registers[VY] & (BitmapHeight - 1);
+      u8  n  = ExtractN(&curr_inst);
+      emu.registers[0xF] = 0;
 
-    if(emu.program_counter == (ibm_logo.size >> 1) - 1)
+      for (u8 row = 0; row < n; row++)
+      {
+        u8 sprite_byte = emu.memory[emu.idx_reg + row];
+        u16 curr_y = (y + row) & (BitmapHeight - 1);
+        for (u8 col = 0; col < 8; col++)
+        {
+          u8 sprite_pixel = sprite_byte & (0b10000000 >> col);
+          if (sprite_pixel)
+          {
+            u16 curr_x = (x + col) & (BitmapWidth - 1);
+            u32* pixel = (u32*)bitmap_buffer + (curr_y * BitmapWidth + curr_x);
+            if (*pixel)
+            {
+              emu.registers[0xF] = 0xFFFF;
+            }
+            *pixel ^= 0xFFFFFFFF;
+          }
+        }
+      }
+    }
+    // 7XNN
+    else if (high_nibble == 0x7)
     {
-      Running = false;
+      u8 NN = ExtractNN(&curr_inst);
+      u8 VX = ExtractX(&curr_inst);
+      emu.registers[VX] += (u16)NN;
+    }
+    // 1NNN
+    else if (high_nibble == 0xF)
+    {
+      u16 NNN = ExtractNNN(&curr_inst);
+      emu.program_counter = NNN;
     }
 
     InvalidateRect(window, NULL, 0);
@@ -298,9 +321,6 @@ Win32ResizeDIBSection(i32 width, i32 height)
     VirtualFree(bitmap_buffer, NULL, MEM_RELEASE);
   }
 
-  BitmapWidth = width;
-  BitmapHeight = height;
-
   bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
   bitmap_info.bmiHeader.biWidth = BitmapWidth;
   bitmap_info.bmiHeader.biHeight = -BitmapHeight;
@@ -314,7 +334,7 @@ Win32ResizeDIBSection(i32 width, i32 height)
   bitmap_info.bmiHeader.biClrImportant = 0;
 
   i32 bytes_per_pixel = 4;
-  i32 bitmap_size = (width * height) * bytes_per_pixel;
+  i32 bitmap_size = (BitmapWidth * BitmapHeight) * bytes_per_pixel;
   bitmap_buffer = VirtualAlloc(NULL, bitmap_size, MEM_COMMIT, PAGE_READWRITE);
 }
 
@@ -332,7 +352,6 @@ Win32UpdateWindow(HDC device_context, RECT* WindowRect, i32 x, i32 y, i32 width,
     // y,
     // width,
     // height,
-    0, 0, BitmapWidth, BitmapHeight,
     0, 0, WindowWidth, WindowHeight,
 
     // source
@@ -340,6 +359,7 @@ Win32UpdateWindow(HDC device_context, RECT* WindowRect, i32 x, i32 y, i32 width,
     // y,
     // width,
     // height,
+    0, 0, BitmapWidth, BitmapHeight,
 
     bitmap_buffer,
     &bitmap_info,
@@ -366,11 +386,12 @@ Win32FillBuffer(u32 color)
 }
 
 internal inline void
-NextInstruction(Emu* emu, Program* program, Instruction* inst)
+NextInstruction(Emu* emu, Instruction* inst)
 {
-  inst->b0 = program->buffer[emu->program_counter];
-  inst->b1 = program->buffer[emu->program_counter];
-  emu->program_counter++;
+  local_persist u8* start_address = emu->memory + 0x200;
+  inst->b0 = start_address[emu->program_counter];
+  inst->b1 = start_address[emu->program_counter + 1];
+  emu->program_counter += 2;
 }
 
 internal inline u16
