@@ -58,7 +58,7 @@ internal inline u8  ExtractY(Instruction* inst);
 internal HWND open_window(str title, i32 width, i32 height);
 LRESULT CALLBACK Win32WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 internal void Win32ResizeDIBSection(i32 width, i32 height);
-internal void Win32UpdateWindow(HDC device_context, RECT* WindowRect, i32 x, i32 y, i32 width, i32 height);
+internal void Win32UpdateWindow(HDC device_context, RECT* WindowRect);
 internal void Win32FillBuffer(u32 color);
 // -------------
 
@@ -303,7 +303,7 @@ Win32WindowProc(HWND Window, UINT uMsg, WPARAM wParam, LPARAM lParam)
       i32 y = paint.rcPaint.top;
       i32 width = paint.rcPaint.right - paint.rcPaint.left;
       i32 height = paint.rcPaint.top - paint.rcPaint.bottom;
-      Win32UpdateWindow(device_context, &paint.rcPaint, x, y, width, height);
+      Win32UpdateWindow(device_context, &paint.rcPaint);
       EndPaint(Window, &paint);
     } break;
     default:
@@ -339,7 +339,7 @@ Win32ResizeDIBSection(i32 width, i32 height)
 }
 
 internal void
-Win32UpdateWindow(HDC device_context, RECT* WindowRect, i32 x, i32 y, i32 width, i32 height)
+Win32UpdateWindow(HDC device_context, RECT* WindowRect)
 {
   WindowWidth = WindowRect->right - WindowRect->left;
   WindowHeight = WindowRect->bottom - WindowRect->top;
