@@ -28,6 +28,12 @@ typedef struct {
 } Instruction;
 
 typedef struct {
+	u16* memory;
+	i32  size;
+	i32 length;
+} Stack;
+
+typedef struct {
 	u8* memory;
 	u16 program_counter;
 	u16 idx_reg;
@@ -35,55 +41,41 @@ typedef struct {
 	u8 delay_timer;
 	u8 sound_timer;
 	Program* current_program;
+	Instruction current_instruction;
+	Stack stack;
+
+	bool running;
+	bool paused;
+	bool debug;
 } Emu;
 
-typedef struct {
-	u16* memory;
-	i32  size;
-	i32 length;
-} Stack;
-
 internal void LoadProgram(Program* program, u8* memory);
-internal inline void NextInstruction(Emu* emu, Instruction* inst);
+internal inline void NextInstruction(Emu* emu);
 internal inline Stack CreateStack(i32 size);
 internal inline void PushStack(Stack* stack, u16 val);
 internal inline u16 PopStack(Stack* stack);
 
-// instructions looks like (A - just any char)
-// ANNN
-// AXNN
-// AXYN
 internal inline u16 ExtractNNN(Instruction* inst);
 internal inline u8 ExtractNN(Instruction* inst);
 internal inline u8 ExtractN(Instruction* inst);
 internal inline u8 ExtractX(Instruction* inst);
 internal inline u8 ExtractY(Instruction* inst);
-internal void print_program(Emu* emu, Instruction* inst);
+internal void PrintProgram(Emu* emu, Instruction* inst);
 
-// --- win32 ---
-internal HWND open_window(str title, i32 width, i32 height);
+internal HWND Win32OpenWindow(str title, i32 width, i32 height);
 LRESULT CALLBACK Win32WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
 	LPARAM lParam);
 internal void Win32ResizeDIBSection(i32 width, i32 height);
 internal void Win32UpdateWindow(HWND Window);
 internal void Win32FillBuffer(u32 color);
-// -------------
 
 internal void Tick(Emu* emu, HWND Window);
 
-global_variable bool Running = false;
-global_variable bool Paused = false;
-global_variable bool Debug = false;
 global_variable BITMAPINFO bitmap_info;
 global_variable void* bitmap_buffer;
-global_variable HBITMAP bitmap_handle;
-global_variable HDC device_context;
 global_variable i32 BitmapWidth = 64;
 global_variable i32 BitmapHeight = 32;
-global_variable i32 WindowWidth;
-global_variable i32 WindowHeight;
-
-global_variable u16 FONT_CHARS[0x10 * 5] = {
+global_variable const u8 FONT_CHARS[0x10 * 5] = {
 0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
 0x20, 0x60, 0x20, 0x20, 0x70, // 1
 0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
@@ -103,48 +95,36 @@ global_variable u16 FONT_CHARS[0x10 * 5] = {
 };
 
 i32 main() {
-#ifdef STOP_EXEC
-	Paused = true;
-#endif
-
 	Program program = {
 		.path = (str)L"./roms/tetris.ch8",
 		.buffer = (u8*)VirtualAlloc(NULL, 512, MEM_COMMIT, PAGE_READWRITE),
-		.buffer_size = 512 };
+		.buffer_size = 512
+	};
 
 	Emu emu = {
 		.memory = (u8*)VirtualAlloc(NULL, 4096, MEM_COMMIT, PAGE_READWRITE),
 		.program_counter = 0x200,
 		.idx_reg = 0,
-		.registers = (u8*)VirtualAlloc(NULL, sizeof(u8) * 0xF, MEM_COMMIT,
-										 PAGE_READWRITE),
-		.current_program = &program };
+		.registers = (u8*)VirtualAlloc(NULL, sizeof(u8) * 16, MEM_COMMIT, PAGE_READWRITE),
+		.current_program = &program,
+		.stack = CreateStack(1024)
+	};
 
-	for (i32 i = 0; i < 0x10; i++) {
-		for (i32 j = 0; j < 0x5; j++) {
-			i32 idx = i * 0x5 + j;
-			emu.memory[idx] = FONT_CHARS[idx];
-		}
-	}
-
-	Stack stack = CreateStack(1024);
+	memcpy(emu.memory, FONT_CHARS, sizeof(FONT_CHARS));
 
 	LoadProgram(&program, emu.memory);
 
-	const i32 WH_FACTOR = 20;
-	const i32 WIDTH = BitmapWidth * WH_FACTOR;
-	const i32 HEIGHT = BitmapHeight * WH_FACTOR;
-
-	HWND window = open_window((str)L"8emu", WIDTH, HEIGHT);
-	MSG msg;
-	Running = true;
+	HWND window = Win32OpenWindow((str)L"8emu", BitmapWidth * 20, BitmapHeight * 20);
+	SetWindowLongPtr(window, GWLP_USERDATA, (LONG_PTR)&emu);
 	ULONGLONG program_start = GetTickCount64();
-	ULONGLONG current_frame_timestamp;
-
 	timeBeginPeriod(1);
-	double MS_PER_FRAME = 1000.0 / 240.0;
-	while (Running) {
-		current_frame_timestamp = GetTickCount64();
+
+	const double MS_PER_FRAME = 1000.0 / 1000.0; // Target: 1000 FPS
+	MSG msg = {0};
+
+	emu.running = true;
+	while (emu.running) {
+		ULONGLONG frame_start = GetTickCount64();
 
 		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
@@ -152,74 +132,99 @@ i32 main() {
 		}
 
 #ifdef _DEBUG
-		if (GetAsyncKeyState(VK_F8) & 0x8000) {
+		local_persist SHORT prev_state = 0;
+		SHORT curr_state = GetAsyncKeyState(VK_F8) & 0x8000;
+		if (!prev_state && curr_state) {
 			Tick(&emu, window);
 		}
+		prev_state = curr_state;
 #endif
 
-		if (Paused) {
-			continue;
+		if (!emu.paused) {
+			Tick(&emu, window);
 		}
 
-		Tick(&emu, window);
+		ULONGLONG elapsed = GetTickCount64() - frame_start;
+		if (elapsed < MS_PER_FRAME) {
+			Sleep(MS_PER_FRAME - elapsed);
+		}
 
-		ULONGLONG elapsed_time = (GetTickCount64() - current_frame_timestamp);
-		if (elapsed_time < MS_PER_FRAME) {
-			Sleep(MS_PER_FRAME - elapsed_time);
+		static u32 frame_counter = 0;
+		static u8 prev_sound_timer = 0;
+		frame_counter++;
+
+		if (frame_counter >= 1000.0 / 60.0) {
+			frame_counter = 0;
+			if (emu.delay_timer > 0) emu.delay_timer--;
+			if (emu.sound_timer > 0) {
+				if (prev_sound_timer == 0) {
+					Beep(0x400, emu.sound_timer * 20);
+				}
+				emu.sound_timer--;
+			}
+			prev_sound_timer = emu.sound_timer;
 		}
 	}
 
-	printf("End Time: %llu\n", GetTickCount64() - program_start);
+	printf("End Time: %llu ms\n", GetTickCount64() - program_start);
 
 	return 0;
 }
 
+
 internal void Tick(Emu* emu, HWND Window) {
-	local_persist Instruction curr_inst = {0}; // TODO: move to Emu
-	local_persist Stack stack = CreateStack(1024); // TODO: move to Emu
+	local_persist u8 key_map[16] = {
+		'X', // 0
+		'1', // 1
+		'2', // 2
+		'3', // 3
+		'Q', // 4
+		'W', // 5
+		'E', // 6
+		'A', // 7
+		'S', // 8
+		'D', // 9
+		'Z', // A
+		'C', // B
+		'4', // C
+		'R', // D
+		'F', // E
+		'V'  // F
+	};
 
-	NextInstruction(emu, &curr_inst);
+	NextInstruction(emu);
 
-	if (emu->delay_timer > 0) {
-		emu->delay_timer--;
-	}
-
-	if (emu->sound_timer > 0) {
-		emu->sound_timer--;
-	}
-
-	u8 high_nibble = curr_inst.b0 >> 4;
-	u8 last_nibble = ExtractN(&curr_inst);
+	u8 high_nibble = emu->current_instruction.b0 >> 4;
+	u8 last_nibble = ExtractN(&emu->current_instruction);
 
 	// 00E0
-	if (curr_inst.b0 == 0x00 && curr_inst.b1 == 0xE0) {
+	if (emu->current_instruction.b0 == 0x00 && emu->current_instruction.b1 == 0xE0) {
 		Win32FillBuffer(0x00000000);
 		Win32UpdateWindow(Window);
 	}
 	// 00EE
-	else if (curr_inst.b0 == 0x00 && curr_inst.b1 == 0xEE) {
-		emu->program_counter = PopStack(&stack);
+	else if (emu->current_instruction.b0 == 0x00 && emu->current_instruction.b1 == 0xEE) {
+		emu->program_counter = PopStack(&emu->stack);
 	}
 	// ANNN
 	else if (high_nibble == 0xA) {
-		emu->idx_reg = ExtractNNN(&curr_inst);
+		emu->idx_reg = ExtractNNN(&emu->current_instruction);
 	}
 	// 6XNN
 	else if (high_nibble == 0x6) {
-		u8 X = ExtractX(&curr_inst);
-		u8 NN = ExtractNN(&curr_inst);
-		*(emu->registers + X) = NN;
+		u8 X = ExtractX(&emu->current_instruction);
+		u8 NN = ExtractNN(&emu->current_instruction);
+		emu->registers[X] = NN;
 	}
 	// DXYN
 	else if (high_nibble == 0xD) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
 		u16 x = emu->registers[VX] & (BitmapWidth - 1);
 		u16 y = emu->registers[VY] & (BitmapHeight - 1);
-		u8 n = last_nibble;
-		emu->registers[0xF] = 0;
+		emu->registers[0xF] = 0x0;
 
-		for (u8 row = 0; row < n; row++) {
+		for (u8 row = 0; row < last_nibble; row++) {
 			u8 sprite_byte = emu->memory[emu->idx_reg + row];
 			u16 curr_y = (y + row) & (BitmapHeight - 1);
 			for (u8 col = 0; col < 8; col++) {
@@ -227,8 +232,8 @@ internal void Tick(Emu* emu, HWND Window) {
 				if (sprite_pixel) {
 					u16 curr_x = (x + col) & (BitmapWidth - 1);
 					u32* pixel = (u32*)bitmap_buffer + (curr_y * BitmapWidth + curr_x);
-					if (*pixel) {
-						emu->registers[0xF] = 0xFFFF;
+					if (*pixel != 0x00000000) {
+						emu->registers[0xF] = 0x1;
 					}
 					*pixel ^= 0xFFFFFFFF;
 				}
@@ -236,203 +241,199 @@ internal void Tick(Emu* emu, HWND Window) {
 		}
 		Win32UpdateWindow(Window);
 	}
+	// BNNN
+	else if (high_nibble == 0xB) {
+		emu->program_counter = emu->registers[0] + ExtractNNN(&emu->current_instruction);
+	}
 	// 7XNN
 	else if (high_nibble == 0x7) {
-		u8 NN = ExtractNN(&curr_inst);
-		u8 VX = ExtractX(&curr_inst);
-		emu->registers[VX] += (u16)NN;
+		emu->registers[ExtractX(&emu->current_instruction)] += ExtractNN(&emu->current_instruction);
 	}
 	// 1NNN
 	else if (high_nibble == 0x1) {
-		u16 NNN = ExtractNNN(&curr_inst);
-		emu->program_counter = NNN;
+		emu->program_counter = ExtractNNN(&emu->current_instruction);
 	}
 	// 2NNN
 	else if (high_nibble == 0x2) {
-		u16 NNN = ExtractNNN(&curr_inst);
-		PushStack(&stack, emu->program_counter);
-		emu->program_counter = NNN;
+		PushStack(&emu->stack, emu->program_counter);
+		emu->program_counter = ExtractNNN(&emu->current_instruction);
 	}
 	// 3XNN
 	else if (high_nibble == 0x3) {
-		u8 NN = ExtractNN(&curr_inst);
-		u8 VX = ExtractX(&curr_inst);
+		u8 NN = ExtractNN(&emu->current_instruction);
+		u8 VX = ExtractX(&emu->current_instruction);
 		if (emu->registers[VX] == NN) {
 			emu->program_counter += 2;
 		}
 	}
 	// 4XNN
 	else if (high_nibble == 0x4) {
-		u8 NN = ExtractNN(&curr_inst);
-		u8 VX = ExtractX(&curr_inst);
+		u8 NN = ExtractNN(&emu->current_instruction);
+		u8 VX = ExtractX(&emu->current_instruction);
 		if (emu->registers[VX] != NN) {
 			emu->program_counter += 2;
 		}
 	}
 	// 5XY0
 	else if (high_nibble == 0x5) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
 		if (emu->registers[VX] == emu->registers[VY]) {
 			emu->program_counter += 2;
 		}
 	}
 	// 9XYN
 	else if (high_nibble == 0x9) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
 		if (emu->registers[VX] != emu->registers[VY]) {
 			emu->program_counter += 2;
 		}
 	}
 	// 8XY0
 	else if (high_nibble == 0x8 && last_nibble == 0x0) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
-		emu->registers[VX] = emu->registers[VY];
+		emu->registers[ExtractX(&emu->current_instruction)] = emu->registers[ExtractY(&emu->current_instruction)];
 	}
 	// 8XY1
 	else if (high_nibble == 0x8 && last_nibble == 0x1) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
-		emu->registers[VX] |= emu->registers[VY];
+		emu->registers[ExtractX(&emu->current_instruction)] |= emu->registers[ExtractY(&emu->current_instruction)];
 	}
 	// 8XY2
 	else if (high_nibble == 0x8 && last_nibble == 0x2) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
-		emu->registers[VX] &= emu->registers[VY];
+		emu->registers[ExtractX(&emu->current_instruction)] &= emu->registers[ExtractY(&emu->current_instruction)];
 	}
 	// 8XY3
 	else if (high_nibble == 0x8 && last_nibble == 0x3) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
-		emu->registers[VX] ^= emu->registers[VY];
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
+		emu->registers[ExtractX(&emu->current_instruction)] ^= emu->registers[ExtractY(&emu->current_instruction)];
 	}
 	// 8XY4
 	else if (high_nibble == 0x8 && last_nibble == 0x4) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
-		emu->registers[VX] += emu->registers[VY];
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
+		u32 result = (u32)emu->registers[VX] + (u32)emu->registers[VY];
+		if (result > 255) {
+			emu->registers[0xF] = 0x1;
+		} else {
+			emu->registers[0xF] = 0x0;
+		}
+		emu->registers[VX] = (u8)result;
 	}
 	// 8XY5
 	else if (high_nibble == 0x8 && last_nibble == 0x5) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
+		if (emu->registers[VX] > emu->registers[VY]) {
+			emu->registers[0xF] = 0x1;
+		} else {
+			emu->registers[0xF] = 0x0;
+		}
 		emu->registers[VX] -= emu->registers[VY];
 	}
 	// 8XY7
 	else if (high_nibble == 0x8 && last_nibble == 0x7) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
-		emu->registers[VY] -= emu->registers[VX];
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
+		if (emu->registers[VY] > emu->registers[VX]) {
+			emu->registers[0xF] = 0x1;
+		} else {
+			emu->registers[0xF] = 0x0;
+		}
+		emu->registers[VX] = emu->registers[VY] - emu->registers[VX];
 	}
 	// 8XY6
 	else if (high_nibble == 0x8 && last_nibble == 0x6) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
 		u16 y = emu->registers[VY];
+		emu->registers[0xF] = emu->registers[VX] & 0x1;
 		emu->registers[VX] = y >> 1;
-		u8 shifted_bit = (u16)(y << 15) >> 15;
-		emu->registers[0xF] = shifted_bit;
 	}
 	// 8XYE
 	else if (high_nibble == 0x8 && last_nibble == 0xe) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 VY = ExtractY(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 VY = ExtractY(&emu->current_instruction);
 		u16 y = emu->registers[VY];
+		emu->registers[0xF] = y >> 15;
 		emu->registers[VX] = y << 1;
-		u8 shifted_bit = y >> 15;
-		emu->registers[0xF] = shifted_bit;
 	}
 	// FX29
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x29) {
-		u8 VX = ExtractX(&curr_inst);
-		emu->idx_reg = emu->registers[VX] * 5;
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x29) {
+		emu->idx_reg = emu->registers[ExtractX(&emu->current_instruction)] * 5;
 	}
 	// FX07
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x07) {
-		u8 VX = ExtractX(&curr_inst);
-		emu->registers[VX] = emu->delay_timer;
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x07) {
+		emu->registers[ExtractX(&emu->current_instruction)] = emu->delay_timer;
 	}
 	// FX15
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x15) {
-		u8 VX = ExtractX(&curr_inst);
-		emu->delay_timer = emu->registers[VX];
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x15) {
+		emu->delay_timer = emu->registers[ExtractX(&emu->current_instruction)];
 	}
 	// FX18
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x18) {
-		u8 VX = ExtractX(&curr_inst);
-		emu->sound_timer = emu->registers[VX];
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x18) {
+		emu->sound_timer = emu->registers[ExtractX(&emu->current_instruction)];
+	}
+	// FX0A
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x0A) {
+		u8 VX = ExtractX(&emu->current_instruction);
+		for (u8 i = 0; i < 16; i++) {
+			if (GetAsyncKeyState(key_map[i]) & 0x8000) {
+				emu->registers[VX] = i;
+				break;
+			}
+		}
+		emu->program_counter -= 2;
 	}
 	// EXA1 or EX9E
 	else if (high_nibble == 0xE) {
-		u8 VX = ExtractX(&curr_inst);
+		u8 VX = ExtractX(&emu->current_instruction);
 		u16 key = emu->registers[VX];
-		local_persist u8 key_map[16] = {
-			'X', // 0
-			'1', // 1
-			'2', // 2
-			'3', // 3
-			'Q', // 4
-			'W', // 5
-			'E', // 6
-			'A', // 7
-			'S', // 8
-			'D', // 9
-			'Z', // A
-			'C', // B
-			'4', // C
-			'R', // D
-			'F', // E
-			'V'  // F
-		};
 		bool Pressed = GetKeyState(key_map[key]) & 0x8000;
-		if ((curr_inst.b1 == 0xA1 && !Pressed) || (curr_inst.b1 == 0x9e && Pressed)) {
+		if ((emu->current_instruction.b1 == 0xA1 && !Pressed) || (emu->current_instruction.b1 == 0x9e && Pressed)) {
 			emu->program_counter += 2;
 		}
 	}
 	// CXNN
 	else if (high_nibble == 0xC) {
-		u8 VX = ExtractX(&curr_inst);
-		u8 NN = ExtractNN(&curr_inst);
-		emu->registers[VX] = (rand() & 255) & NN;
+		u8 VX = ExtractX(&emu->current_instruction);
+		u8 NN = ExtractNN(&emu->current_instruction);
+		double r = (double)rand() / RAND_MAX;
+		emu->registers[VX] = (u8)(r * 256) & NN;
 	}
 	// FX1E
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x1E) {
-		u8 VX = ExtractX(&curr_inst);
-		emu->idx_reg += emu->registers[VX];
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x1E) {
+		emu->idx_reg += emu->registers[ExtractX(&emu->current_instruction)];
 	}
 	// FX55
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x55) {
-		u8 VX = ExtractX(&curr_inst);
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x55) {
+		u8 VX = ExtractX(&emu->current_instruction);
 		for (u8 i = 0; i <= VX; i++) {
 			emu->memory[emu->idx_reg + i] = emu->registers[i];
 		}
 	}
 	// FX65
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x65) {
-		u8 VX = ExtractX(&curr_inst);
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x65) {
+		u8 VX = ExtractX(&emu->current_instruction);
 		for (u8 i = 0; i <= VX; i++) {
 			emu->registers[i] = emu->memory[emu->idx_reg + i];
 		}
 	}
 	// FX33
-	else if (high_nibble == 0xF && curr_inst.b1 == 0x33) {
-		u8 VX = ExtractX(&curr_inst);
-		u16 x = emu->registers[VX];
-		emu->memory[emu->idx_reg] = x / 100;
+	else if (high_nibble == 0xF && emu->current_instruction.b1 == 0x33) {
+		u16 x = emu->registers[ExtractX(&emu->current_instruction)];
+		emu->memory[emu->idx_reg + 0] = x / 100;
 		emu->memory[emu->idx_reg + 1] = (x / 10) % 10;
 		emu->memory[emu->idx_reg + 2] = x % 10;
 	}
 	else {
-		printf("Unhandled Instruction %x %x\n", curr_inst.b0, curr_inst.b1);
+		printf("Unhandled Instruction %x %x\n", emu->current_instruction.b0, emu->current_instruction.b1);
 	}
 
 #ifdef _DEBUG
-	if (Debug) {
+	if (emu->debug) {
 		system("cls");
-		print_program(emu, &curr_inst);
+		PrintProgram(emu, &emu->current_instruction);
 	}
 #endif
 }
@@ -467,7 +468,7 @@ internal void LoadProgram(Program* program, u8* memory) {
 	CloseHandle(hfile);
 }
 
-HWND open_window(str title, i32 width, i32 height) {
+HWND Win32OpenWindow(str title, i32 width, i32 height) {
 	LPCWSTR CLASS_NAME = L"Sample Window Class";
 
 	WNDCLASS wc = {};
@@ -507,6 +508,8 @@ LRESULT CALLBACK Win32WindowProc(HWND Window, UINT uMsg, WPARAM wParam,
 	LPARAM lParam) {
 	LRESULT result = 0;
 
+	Emu* emu = (Emu*)GetWindowLongPtr(Window, GWLP_USERDATA);
+
 	switch (uMsg) {
 	case WM_SIZE: {
 		RECT client_rect;
@@ -516,10 +519,10 @@ LRESULT CALLBACK Win32WindowProc(HWND Window, UINT uMsg, WPARAM wParam,
 		Win32ResizeDIBSection(width, height);
 	} break;
 	case WM_CLOSE: {
-		Running = false;
+		emu->running = false;
 	} break;
 	case WM_DESTROY: {
-		Running = false;
+		emu->running = false;
 	} break;
 	case WM_PAINT: {
 	    PAINTSTRUCT ps;
@@ -530,11 +533,11 @@ LRESULT CALLBACK Win32WindowProc(HWND Window, UINT uMsg, WPARAM wParam,
 	case WM_KEYDOWN: {
 		// 0x75 - F6
 		if (wParam == 0x75) {
-			Paused = !Paused;
+			emu->paused = !emu->paused;
 		}
 		// 0x76 - F7
 		if (wParam == 0x76) {
-			Debug = !Debug;
+			emu->debug = !emu->debug;
 		}
 	} break;
 	default:
@@ -569,8 +572,8 @@ internal void Win32ResizeDIBSection(i32 width, i32 height) {
 internal void Win32UpdateWindow(HWND Window) {
 	RECT WindowRect;
 	GetClientRect(Window, &WindowRect);
-	WindowWidth = WindowRect.right - WindowRect.left;
-	WindowHeight = WindowRect.bottom - WindowRect.top;
+	i32 WindowWidth = WindowRect.right - WindowRect.left;
+	i32 WindowHeight = WindowRect.bottom - WindowRect.top;
 	HDC DeviceContext = GetDC(Window);
 	StretchDIBits(DeviceContext,
 
@@ -604,16 +607,14 @@ internal void Win32FillBuffer(u32 color) {
 	}
 }
 
-internal inline void NextInstruction(Emu* emu, Instruction* inst) {
-	inst->b0 = emu->memory[emu->program_counter];
-	inst->b1 = emu->memory[emu->program_counter + 1];
+internal inline void NextInstruction(Emu* emu) {
+	emu->current_instruction.b0 = emu->memory[emu->program_counter];
+	emu->current_instruction.b1 = emu->memory[emu->program_counter + 1];
 	emu->program_counter += 2;
 }
 
 internal inline u16 ExtractNNN(Instruction* inst) {
-	u8 b0 = (u8)(inst->b0 << 4);
-	u8 b1 = inst->b1;
-	return (u16)((b0 << 4) | b1);
+    return (u16)(((inst->b0 & 0x0F) << 8) | inst->b1);
 }
 
 internal inline u8 ExtractNN(Instruction* inst) { return inst->b1; }
@@ -630,7 +631,7 @@ internal inline u8 ExtractY(Instruction* inst) {
 	return inst->b1 >> 4;
 }
 
-internal void print_program(Emu* emu, Instruction* inst) {
+internal void PrintProgram(Emu* emu, Instruction* inst) {
 	local_persist u16 start_address = 0x200;
 	i32 rows = roundf((float)(emu->current_program->size / 0xF));
 	for (i32 row = 0; row < rows; row++) {
@@ -661,11 +662,11 @@ internal inline Stack CreateStack(i32 size) {
 }
 
 internal inline void PushStack(Stack* stack, u16 val) {
+	assert(stack->length < stack->size);
 	stack->memory[stack->length++] = val;
 }
 
 internal inline u16 PopStack(Stack* stack) {
 	assert(stack->length > 0);
-	stack->length--;
-	return stack->memory[stack->length];
+	return stack->memory[--stack->length];
 }
