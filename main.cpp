@@ -644,7 +644,7 @@ internal void PrintProgram(Emu* emu, Instruction* inst) {
 			if (emu->program_counter == idx - 1 + start_address) {
 				printf(">");
 			}
-			if (idx & (2 - 1)) {
+			if (idx & 1) {
 				printf(" ");
 			}
 		}
